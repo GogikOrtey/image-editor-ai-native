@@ -1,0 +1,60 @@
+# Image Editor (AI native)
+
+## Что это
+
+Веб-сервис для точечного inpainting-редактирования изображений по маске через API нейросетей.
+Пользователь загружает картинку, выделяет область (лассо/прямоугольник/кисть), описывает
+изменение текстом, и API (ChatGPT Image, Gemini Nano Banana или роутер) генерирует правку
+только в выделенной зоне. Минималистичный интерфейс, светлая тема, без лишних инструментов
+рисования.
+
+## Текущая фаза
+
+MVP (Фаза 1) - базовый редактор без многопользовательского режима.
+Настройки API (ключ, base URL, модель) хранятся в localStorage браузера.
+
+## Стек
+
+- Frontend: Vue 3 + Vite + TypeScript + HTML Canvas + CSS
+- Backend: FastAPI (совместим с Python 3.10+)
+- Палитра: светлая (#F8FAFC, #FFFFFF, #E2E8F0, акцент #2563EB)
+
+## Структура
+
+- `frontend/src/App.vue` - основной интерфейс, canvas, маска, история, настройки и генерация
+- `frontend/src/style.css` - адаптивный светлый интерфейс
+- `frontend/vite.config.ts` - Vite и proxy `/api` на `127.0.0.1:8000`
+- `backend/app/main.py` - FastAPI app, CORS и health route
+- `backend/app/routers/inpaint.py` - общий `/api/inpaint` и provider-specific endpoints
+- `backend/app/services/providers.py` - HTTP adapters для OpenAI-compatible API и Gemini
+- `backend/tests/` - health и API contract tests
+
+## Как запускать
+
+Frontend:
+  cd frontend
+  npm install
+  npm run dev
+
+Backend:
+  cd backend
+  python -m venv venv
+  venv\Scripts\activate
+  pip install -r requirements.txt
+  uvicorn app.main:app --reload --port 8000
+
+## Принятые решения
+
+- Vue 3 + Canvas 2D: лёгкий интерфейс и прямой контроль маски в координатах изображения
+- FastAPI: backend proxy, Pillow-конвертация OpenAI mask, httpx для provider requests
+- Общий контракт: `POST /api/inpaint`, request-scoped `X-Provider-API-Key`, binary image response
+- OpenAI-compatible routers идут через OpenAI adapter; Gemini использует generateContent
+- API-ключ хранится только в localStorage MVP; для production потребуется серверное secret storage
+- Окружение разработки: Node.js 22.15, Python 3.10.10
+
+## Состояние
+
+Frontend и backend MVP реализованы. Upload, canvas tools, zoom/pan, mask, undo/redo, provider settings,
+localStorage и PNG export работают на клиенте. FastAPI health и provider proxy routes готовы.
+Проверены `npm run build` и backend tests; реальную генерацию с внешними API ещё нужно проверить
+с рабочими ключом и моделью. Следующий шаг: пользовательская проверка UI и live provider smoke test.
