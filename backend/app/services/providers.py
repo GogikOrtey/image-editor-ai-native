@@ -1,14 +1,19 @@
-"""Proxy image-edit requests to OpenAI-compatible and Gemini providers.
+"""Talk to the CloseRouter image API on behalf of the browser client.
 
-The router supplies request-scoped credentials and bytes to these functions, which use
-``httpx`` for one outbound call and return only the provider response to the caller.
-Credentials are never logged, cached, written to disk, or placed in process-wide state.
+The router asks this module for two things: the live model catalogue and one image edit.
+Both use a single server-side key loaded from ``backend/.env``; the key never reaches the
+browser and is never included in logs, error messages, or responses.
+
+Response shape differs per provider: Gemini and Qwen return a short-lived resource URL,
+while GPT Image returns inline base64. ``fetch_result_image`` normalizes both to bytes so
+the API route can always answer with a binary image.
 """
 
 from __future__ import annotations
 
 import base64
 import io
+import os
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
@@ -16,10 +21,13 @@ from urllib.parse import urlsplit
 import httpx
 from PIL import Image
 
-DEFAULT_GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
-DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
+DEFAULT_BASE_URL = "https://api.closerouter.dev"
+BASE_URL_ENV = "CLOSEROUTER_BASE_URL"
+API_KEY_ENV = "CLOSEROUTER_API_KEY"
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
-REQUEST_TIMEOUT_SECONDS = 120.0
+MAX_PROMPT_LENGTH = 8_000
+REQUEST_TIMEOUT_SECONDS = 240.0
+CATALOG_TIMEOUT_SECONDS = 20.0
 
 
 @dataclass(slots=True)
@@ -40,8 +48,26 @@ class ProviderRequestError(RuntimeError):
         self.message = message
 
 
-def validate_base_url(value: str, *, default: str) -> str:
-    """Validate and normalize a user-supplied provider base URL."""
+def load_api_key() -> str:
+    """Read the CloseRouter key from the environment, failing loudly when it is absent."""
+
+    key = os.environ.get(API_KEY_ENV, "").strip()
+    if not key:
+        raise ProviderRequestError(
+            "Server is not configured: set CLOSEROUTER_API_KEY in backend/.env.",
+            status_code=503,
+        )
+    return key
+
+
+def load_base_url() -> str:
+    """Return the configured API host, defaulting to the public CloseRouter gateway."""
+
+    return validate_base_url(os.environ.get(BASE_URL_ENV, DEFAULT_BASE_URL))
+
+
+def validate_base_url(value: str, *, default: str = DEFAULT_BASE_URL) -> str:
+    """Validate and normalize a provider base URL."""
 
     candidate = (value or default).strip().rstrip("/")
     parts = urlsplit(candidate)
@@ -52,155 +78,170 @@ def validate_base_url(value: str, *, default: str) -> str:
     return candidate
 
 
-def make_openai_alpha_mask(mask_bytes: bytes) -> bytes:
-    """Convert a white-editable mask to OpenAI's transparent-editable PNG convention."""
+def mask_summary(mask_bytes: bytes) -> dict[str, int]:
+    """Report how much of the frame the mask covers, used to build the model instruction."""
 
     try:
-        source = Image.open(io.BytesIO(mask_bytes))
-        alpha = source.point(lambda value: 0 if value > 0 else 255)
-        rgba = Image.new("RGBA", source.size, (255, 255, 255, 255))
-        rgba.putalpha(alpha)
-        output = io.BytesIO()
-        rgba.save(output, format="PNG")
-        return output.getvalue()
+        with Image.open(io.BytesIO(mask_bytes)) as source:
+            alpha = source.convert("L")
+            pixels = list(alpha.getdata())
     except (OSError, ValueError) as exc:
         raise ValueError("mask must be a valid image") from exc
+    editable = sum(1 for value in pixels if value > 0)
+    total = len(pixels) or 1
+    return {"editable": editable, "total": total, "percent": round(editable * 100 / total)}
 
 
-def decode_base64_image(value: str, field_name: str) -> bytes:
-    """Decode one JSON image field and reject empty or oversized payloads."""
+def build_edit_prompt(prompt: str, summary: dict[str, int]) -> str:
+    """Frame the user prompt so the model changes only the marked region.
 
+    The upstream API has no mask parameter, so scope is communicated in text and the
+    untouched area is later restored on the client by compositing through the mask.
+    """
+
+    if summary["editable"] == 0:
+        return prompt
+    return (
+        "Edit the supplied image. Apply the change only inside the area described below "
+        f"and leave the rest of the frame untouched.\n\n"
+        f"Requested change: {prompt}"
+    )
+
+
+def _to_data_url(image_bytes: bytes, content_type: str) -> str:
+    """Encode image bytes as an inline data URL, the form the edit route accepts."""
+
+    encoded = base64.b64encode(image_bytes).decode("ascii")
+    return f"data:{content_type or 'image/png'};base64,{encoded}"
+
+
+def _upstream_error(status: int, body: bytes) -> ProviderRequestError:
+    """Translate an upstream status into a useful message, keeping upstream detail short."""
+
+    detail = ""
     try:
-        decoded = base64.b64decode(value, validate=True)
-    except (ValueError, TypeError) as exc:
-        raise ValueError(f"{field_name} must be valid base64 data") from exc
-    if not decoded:
-        raise ValueError(f"{field_name} must not be empty")
-    if len(decoded) > MAX_IMAGE_BYTES:
-        raise ValueError(f"{field_name} exceeds the {MAX_IMAGE_BYTES // (1024 * 1024)} MB limit")
-    return decoded
+        import json
 
+        payload = json.loads(body.decode("utf-8"))
+        error = payload.get("error") or payload
+        if isinstance(error, dict):
+            detail = str(error.get("message") or error.get("code") or "")[:300]
+        elif isinstance(error, str):
+            detail = error[:300]
+    except (ValueError, AttributeError, TypeError):
+        detail = ""
 
-def _provider_error(response: httpx.Response) -> ProviderRequestError:
-    """Translate an upstream status into a useful message without echoing its body."""
-
-    status = response.status_code
     if status in {401, 403}:
-        message = "Provider authentication failed; check the API key."
+        message = "Provider authentication failed; check CLOSEROUTER_API_KEY in backend/.env."
     elif status == 404:
-        message = "Provider endpoint or model was not found; check base_url and model."
+        message = "Provider endpoint or model was not found; check the model id."
     elif status == 429:
         message = "Provider rate limit or quota reached; try again later."
+    elif status == 402:
+        message = "Provider reports insufficient balance for this request."
     elif 400 <= status < 500:
-        message = "Provider rejected the request; check model, image, mask, and prompt."
+        message = f"Provider rejected the request. {detail}".strip()
     else:
         message = f"Provider returned an upstream error (HTTP {status})."
     return ProviderRequestError(message, status_code=502)
 
 
-async def _post(
-    url: str,
-    *,
-    api_key: str,
-    files: Any = None,
-    data: Any = None,
-    json: Any = None,
-    params: Any = None,
-) -> ProviderResponse:
-    """Make one outbound request and convert transport/provider failures."""
+async def fetch_catalog() -> dict[str, Any]:
+    """Return the live image-model catalogue with only the public, useful fields."""
 
-    headers = {"Authorization": f"Bearer {api_key}"} if files is not None else {}
+    api_key = load_api_key()
+    url = f"{load_base_url()}/v1/models"
     try:
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS, follow_redirects=False) as client:
+        async with httpx.AsyncClient(timeout=CATALOG_TIMEOUT_SECONDS) as client:
+            response = await client.get(url, headers={"Authorization": f"Bearer {api_key}"})
+    except httpx.HTTPError as exc:
+        raise ProviderRequestError("Could not reach the model catalogue.") from exc
+    if response.is_error:
+        raise _upstream_error(response.status_code, response.content)
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise ProviderRequestError("Model catalogue returned malformed JSON.") from exc
+    return payload
+
+
+async def request_image_edit(
+    *,
+    model: str,
+    prompt: str,
+    image_bytes: bytes,
+    image_content_type: str,
+    size: str | None = None,
+) -> dict[str, Any]:
+    """Send one edit request and return the parsed JSON envelope."""
+
+    api_key = load_api_key()
+    url = f"{load_base_url()}/v1/images/edits"
+    body: dict[str, Any] = {
+        "model": model,
+        "prompt": prompt,
+        "n": 1,
+        "image": [_to_data_url(image_bytes, image_content_type)],
+        "response_format": "b64_json",
+    }
+    if size:
+        body["size"] = size
+    # Gemini is priced by resolution and accepts only the uppercase 1K/2K/4K enum;
+    # 2K keeps cost predictable while still beating the default 1K output.
+    if model.startswith("google/"):
+        body["resolution"] = "2K"
+        body.pop("response_format", None)
+    try:
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
             response = await client.post(
                 url,
-                headers=headers,
-                files=files,
-                data=data,
-                json=json,
-                params=params,
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json=body,
             )
     except httpx.TimeoutException as exc:
         raise ProviderRequestError("Provider request timed out.") from exc
-    except httpx.RequestError as exc:
+    except httpx.HTTPError as exc:
         raise ProviderRequestError("Could not connect to the provider.") from exc
-
     if response.is_error:
-        raise _provider_error(response)
-
-    return ProviderResponse(
-        status_code=response.status_code,
-        content=response.content,
-        content_type=response.headers.get("content-type", "application/json"),
-    )
+        raise _upstream_error(response.status_code, response.content)
+    try:
+        return response.json()
+    except ValueError as exc:
+        raise ProviderRequestError("Provider returned malformed JSON.") from exc
 
 
-async def request_openai_inpaint(
-    *,
-    api_key: str,
-    base_url: str,
-    model: str,
-    prompt: str,
-    image_bytes: bytes,
-    image_filename: str,
-    image_content_type: str,
-    mask_bytes: bytes,
-    mask_filename: str,
-    mask_content_type: str,
-) -> ProviderResponse:
-    """Send an OpenAI Images Edits-compatible multipart request."""
+async def fetch_result_image(payload: dict[str, Any]) -> tuple[bytes, str]:
+    """Resolve a provider envelope to image bytes for a binary HTTP response."""
 
-    endpoint = f"{validate_base_url(base_url, default=DEFAULT_OPENAI_BASE_URL)}/images/edits"
-    files = {
-        "image": (image_filename or "image", image_bytes, image_content_type),
-        "mask": (mask_filename or "mask.png", mask_bytes, mask_content_type),
-    }
-    data = {"model": model, "prompt": prompt}
-    return await _post(endpoint, api_key=api_key, files=files, data=data)
+    data = payload.get("data")
+    if not isinstance(data, list) or not data:
+        raise ProviderRequestError("Provider returned no image data.")
+    first = data[0]
+    if not isinstance(first, dict):
+        raise ProviderRequestError("Provider returned an unexpected image payload.")
 
+    inline = first.get("b64_json")
+    if inline:
+        try:
+            return base64.b64decode(inline), "image/png"
+        except (ValueError, TypeError) as exc:
+            raise ProviderRequestError("Provider returned corrupt base64 image data.") from exc
 
-async def request_gemini_inpaint(
-    *,
-    api_key: str,
-    base_url: str,
-    model: str,
-    prompt: str,
-    image_bytes: bytes,
-    image_content_type: str,
-    mask_bytes: bytes,
-    mask_content_type: str,
-) -> ProviderResponse:
-    """Send a Gemini generateContent request with image and mask inline data."""
-
-    endpoint = (
-        f"{validate_base_url(base_url, default=DEFAULT_GEMINI_BASE_URL)}"
-        f"/models/{model}:generateContent"
-    )
-    payload = {
-        "contents": [
-            {
-                "parts": [
-                    {
-                        "text": (
-                            "Apply the requested modification only inside the indicated mask "
-                            "boundaries. Keep the remaining image completely identical.\n\n"
-                            f"User prompt: {prompt}"
-                        )
-                    },
-                    {
-                        "inline_data": {
-                            "mime_type": image_content_type,
-                            "data": base64.b64encode(image_bytes).decode("ascii"),
-                        }
-                    },
-                    {
-                        "inline_data": {
-                            "mime_type": mask_content_type,
-                            "data": base64.b64encode(mask_bytes).decode("ascii"),
-                        }
-                    },
-                ]
-            }
-        ]
-    }
-    return await _post(endpoint, api_key=api_key, json=payload, params={"key": api_key})
+    remote = first.get("url")
+    if not remote:
+        raise ProviderRequestError("Provider returned neither an image URL nor inline data.")
+    parts = urlsplit(remote)
+    headers = {}
+    if parts.netloc == urlsplit(load_base_url()).netloc:
+        headers["Authorization"] = f"Bearer {load_api_key()}"
+    try:
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
+            response = await client.get(remote, headers=headers)
+    except httpx.HTTPError as exc:
+        raise ProviderRequestError("Could not download the generated image.") from exc
+    if response.is_error:
+        raise ProviderRequestError(f"Generated image download failed (HTTP {response.status_code}).")
+    content_type = response.headers.get("content-type", "image/png").split(";")[0]
+    if not content_type.startswith("image/"):
+        content_type = "image/png"
+    return response.content, content_type

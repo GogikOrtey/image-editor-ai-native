@@ -2,88 +2,103 @@
 
 ## Что это
 
-Веб-сервис для точечного inpainting-редактирования изображений по маске через API нейросетей.
+Веб-сервис для точечного редактирования изображений по маске через API нейросетей.
 Пользователь загружает картинку, выделяет область (лассо/прямоугольник/кисть), описывает
-изменение текстом, и API (ChatGPT Image, Gemini Nano Banana или роутер) генерирует правку
-только в выделенной зоне. Минималистичный интерфейс, светлая тема, без лишних инструментов
-рисования.
+изменение текстом, и модель генерирует правку. Минималистичный интерфейс, светлая тема,
+без лишних инструментов рисования.
 
 ## Текущая фаза
 
-MVP (Фаза 1) - базовый редактор без многопользовательского режима.
-Настройки API (ключ, base URL, модель) хранятся в localStorage браузера.
+MVP (Фаза 1) без многопользовательского режима. Все провайдеры идут через один шлюз
+CloseRouter (`https://api.closerouter.dev`): один ключ, один баланс, 6 image-моделей.
 
 ## Стек
 
 - Frontend: Vue 3 + Vite + TypeScript + HTML Canvas + CSS
-- Backend: FastAPI (совместим с Python 3.10+)
+- Backend: FastAPI (совместим с Python 3.10+), httpx, Pillow
 - Палитра: светлая (#F8FAFC, #FFFFFF, #E2E8F0, акцент #2563EB)
 
 ## Структура
 
-- `frontend/src/App.vue` - основной интерфейс, canvas, маска, история, настройки и генерация
-- `frontend/src/style.css` - адаптивный светлый интерфейс
-- `frontend/vite.config.ts` - Vite и proxy `/api` на `127.0.0.1:8000`
-- `backend/app/main.py` - FastAPI app, CORS и health route
-- `backend/app/routers/inpaint.py` - общий `/api/inpaint` и provider-specific endpoints
-- `backend/app/services/providers.py` - HTTP adapters для OpenAI-compatible API и Gemini
-- `backend/tests/` - health и API contract tests
+- `frontend/src/App.vue` - интерфейс, canvas, маска, история, выбор модели, генерация и композит
+- `frontend/src/style.css` - адаптивный светлый интерфейс, включая карточки моделей
+- `frontend/vite.config.ts` - Vite и proxy `/api` на `127.0.0.1:8000` с таймаутом 600 с
+- `backend/app/main.py` - FastAPI app, CORS, загрузка `.env` и health route
+- `backend/app/routers/inpaint.py` - `GET /api/models` (каталог) и `POST /api/inpaint`
+- `backend/app/services/providers.py` - адаптер CloseRouter: каталог, edit, выгрузка результата
+- `backend/tests/` - health и contract tests (провайдер замокан, сеть не нужна)
 
 ## Репозиторий и секреты
 
-- Публичный репозиторий: https://github.com/GogikOrtey/image-editor-ai-native (ветка `main`, remote `origin`)
-- `Ключик и доступные модели.txt` - реальные API-ключи и список моделей. В git не попадает,
-  закрыт в `.gitignore` первой строкой. Не добавлять `-f`, не переносить содержимое в коммиты,
-  README и логи. Перед первым пушем индекс проверен: файла в репозитории нет.
-- `.gitignore` в корне закрывает: секреты (`*.env`, `*.pem`, `*.key`), `node_modules/`, `dist/`,
-  `__pycache__/`, `venv/`, `.pytest_cache/`, а также системные файлы OneDrive (`desktop.ini`
-  и числовой `.ico` рядом с ним).
+- Публичный репозиторий: https://github.com/GogikOrtey/image-editor-ai-native (ветка `main`)
+- `Ключик и доступные модели.txt` - реальные ключи и список моделей, в git не попадает.
+- `backend/.env` - рабочий ключ `CLOSEROUTER_API_KEY` и `CLOSEROUTER_BASE_URL`. Файл закрыт
+  `.gitignore`, в репозиторий и логи не попадает. Ключ читается только на сервере,
+  в браузер не передаётся.
+- `.gitignore` закрывает: секреты (`*.env`, `*.pem`, `*.key`), `node_modules/`, `dist/`,
+  `__pycache__/`, `venv/`, `.pytest_cache/`, системные файлы OneDrive.
 
 ## Как запускать
+
+Backend:
+  cd backend
+  pip install -r requirements.txt
+  python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 
 Frontend:
   cd frontend
   npm install
-  npm run dev
-
-Backend:
-  cd backend
-  python -m venv venv
-  venv\Scripts\activate
-  pip install -r requirements.txt
-  uvicorn app.main:app --reload --port 8000
+  npx vite --host=127.0.0.1 --port=5173 --strictPort
 
 ## Принятые решения
 
 - Vue 3 + Canvas 2D: лёгкий интерфейс и прямой контроль маски в координатах изображения
-- FastAPI: backend proxy, Pillow-конвертация OpenAI mask, httpx для provider requests
-- Общий контракт: `POST /api/inpaint`, request-scoped `X-Provider-API-Key`, binary image response
-- OpenAI-compatible routers идут через OpenAI adapter; Gemini использует generateContent
-- API-ключ хранится только в localStorage MVP; для production потребуется серверное secret storage
-- Окружение разработки: Node.js 22.15, Python 3.10.10
+- FastAPI как прокси: ключ и выгрузка результата на сервере, браузер получает только байты
+- Общий контракт: `POST /api/inpaint` multipart (image, mask, prompt, model), ответ - бинарная картинка
+- Каталог моделей не хардкодится: `GET /api/models` проксирует живой список и фильтрует image-модели
+- Окружение: Node.js 22.15, Python 3.10.10
+
+### Маска: композит на клиенте
+
+CloseRouter **не принимает mask** - ни одна из 24 операций каталога не имеет такого поля.
+Поэтому маска уходит на сервер только для статистики покрытия и формулировки инструкции,
+а после ответа клиент накладывает сгенерированный кадр на исходный через маску с blur 2 px.
+Так сохраняется смысл ТЗ (меняется только выделенное) при честном использовании API.
 
 ## Состояние
 
-Frontend и backend MVP реализованы. Upload, canvas tools, zoom/pan, mask, undo/redo, provider settings,
-localStorage и PNG export работают на клиенте. FastAPI health и provider proxy routes готовы.
-Проверены `npm run build` и backend tests; реальную генерацию с внешними API ещё нужно проверить
-с рабочими ключом и моделью. Следующий шаг: пользовательская проверка UI и live provider smoke test.
+Готово и проверено вживую: загрузка, инструменты маски, undo/redo, выбор модели из живого
+каталога, генерация через прокси, композит по маске, выгрузка PNG. Backend `10 passed`,
+`npm run build` проходит.
 
-Git: репозиторий инициализирован, первый коммит `6be83a5` (31 файл) отправлен в публичный
-GitHub. Дальнейшая работа ведётся в `main` с пушами в `origin`.
+Проверенные модели и фактические замеры (2026-10-28, картинка 512x512):
 
-Проверено вживую (2026-10-28): `npm run build` проходит, backend `5 passed`, страница
-`http://127.0.0.1:5173` рендерит весь интерфейс, `/api/health` через Vite-proxy отвечает
-`200`. Сквозной запрос Vite -> FastAPI -> OpenAI с невалидным ключом вернул `502`
-`Provider authentication failed`, то есть конвертация маски и проксирование работают.
-Ещё не проверено с рабочим ключом: фактическая генерация и разбор ответа Gemini.
+- `openai/gpt-image-2.5-flare` - 24-97 с, ответ `b64_json`, ~$0.015
+- `openai/gpt-image-2.5-sunburst` - 22-50 с, ответ `b64_json`, ~$0.015
+- `google/gemini-3.1-flash-image-preview` - 35 с, ответ по URL, 2048x2048
+- `google/gemini-3-pro-image` - 41-49 с, ответ по URL, 2048x2048
+- `qwen/qwen-image-3.0` - 24-29 с, ответ по URL, 1344x768, ~$0.054
+- `qwen/qwen-image-3.0-pro` - 68-86 с, самый дорогой (~$0.078), иногда 504 по таймауту
+
+Генерация платная - при отладке проверять одной моделью, не прогонять весь список.
+
+Следующий шаг: пользовательская проверка UI, затем Фаза 2 (авторизация, серверные пресеты,
+история генераций в БД).
 
 Грабли:
 
-- `npm run dev -- --port 5173` в этом окружении передаёт аргументы неверно (Vite падает
-  с `Unused args`). Запускать `npx vite --host=127.0.0.1 --port=5173 --strictPort`.
+- `api.closerouter.com` (`.com`!) не существует: домен делегирован без рабочих NS, локальный
+  DNS отдаёт мусорный IP. Рабочий хост - `api.closerouter.dev`.
+- `/v1/models` живёт на `api.closerouter.dev`, а `closerouter.dev/v1/models` даёт 404.
+- Поле `resolution` у Gemini принимает только `1K`/`2K`/`4K` в верхнем регистре; `2k` даёт
+  400 `Invalid image operation input`.
+- `response_format: b64_json` не принимается Gemini-моделями, поэтому для них он снимается.
+- Ответы приходят в двух видах: `data[0].b64_json` у OpenAI и `data[0].url` у Gemini/Qwen.
+  Ссылка живёт 30 дней и требует `Authorization` для хостов CloseRouter.
+- Qwen edit ждёт поле `image_urls`, а не `image`; лишнее поле даёт 400.
+- Медленные модели упирались в 504 на dev-proxy Vite - поднят `proxyTimeout` до 600 с.
+- `npm run dev -- --port 5173` передаёт аргументы неверно (Vite падает с `Unused args`).
+  Запускать `npx vite --host=127.0.0.1 --port=5173 --strictPort`.
 - Vite по умолчанию слушает только IPv6 `::1`, поэтому `127.0.0.1` не отвечает.
-  Нужен явный `--host=127.0.0.1`.
-- OpenAI ждёт в маске прозрачность в редактируемой зоне, а UI рисует белую область.
-  Конвертация в `make_openai_alpha_mask`; для Gemini маска уходит как есть.
+- FastAPI с `@router.post("")` монтируется как `/api` без слэша - нужен явный `/inpaint`.
 - Скриншоты headless Edge требуют явного `--user-data-dir`, иначе файл не создаётся.

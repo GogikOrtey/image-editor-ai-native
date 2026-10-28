@@ -1,16 +1,22 @@
 """Create the FastAPI application and its local-development middleware.
 
-The frontend calls the health and inpainting routes mounted below the ``/api`` prefix.
-CORS is limited to localhost origins, and no application-level storage is used for API keys.
+The frontend calls the health, model-catalogue, and inpainting routes mounted below the
+``/api`` prefix. CORS is limited to localhost origins. ``backend/.env`` is loaded at import
+time so the CloseRouter key stays on the server and is never sent to the browser.
 """
 
+from pathlib import Path
+
+from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.routers.inpaint import router as inpaint_router
 
+# Load secrets before any route reads them; the file is git-ignored and stays local.
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
-app = FastAPI(title="Image Editor API", version="0.1.0")
+app = FastAPI(title="Image Editor API", version="0.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -28,4 +34,4 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-app.include_router(inpaint_router, prefix="/api/inpaint", tags=["inpaint"])
+app.include_router(inpaint_router, prefix="/api", tags=["image"])

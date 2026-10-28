@@ -7,25 +7,42 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import {
-  Blend, Brush, Check, ChevronDown, Download, Eraser, Eye, EyeOff, FileImage, Hand,
+  Blend, Brush, Check, Cpu, Download, Eraser, Eye, EyeOff, FileImage, Hand,
   ImagePlus, LoaderCircle, Lasso, Minus, MousePointer2, Pencil,
-  Plus, Redo2, RotateCcw, Settings2, Sparkles, Trash2, Undo2, Upload, WandSparkles,
+  Plus, Redo2, RotateCcw, Sparkles, Trash2, Undo2, Upload, WandSparkles,
   X,
 } from 'lucide-vue-next'
 
 type Tool = 'select' | 'brush' | 'rectangle' | 'lasso' | 'eraser'
-type Provider = 'openai' | 'gemini' | 'router'
 type Point = { x: number; y: number }
 type HistoryItem = { id: number; url: string; label: string; createdAt: string }
 type UndoSnapshot = { mask: Uint8ClampedArray; imageUrl: string; imageName: string; sourceBlob: Blob | null }
 
-type Settings = {
-  provider: Provider
-  model: string
-  baseUrl: string
-  apiKey: string
-  prompt: string
+/** One catalogue entry as returned by GET /api/models. */
+type ModelEntry = { id: string; name: string | null; aliases: string[] | null }
+
+/** A picker row: one provider with its lighter and heavier model side by side. */
+type ModelGroup = { key: string; provider: string; family: string; tiers: ModelEntry[] }
+
+const MODEL_LABELS: Record<string, { provider: string; family: string; tier: string }> = {
+  'openai/gpt-image-2.5-flare': { provider: 'OpenAI', family: 'GPT Image 2.5', tier: 'Flash' },
+  'openai/gpt-image-2.5-sunburst': { provider: 'OpenAI', family: 'GPT Image 2.5', tier: 'Pro' },
+  'google/gemini-3.1-flash-image-preview': { provider: 'Google', family: 'Nano Banana', tier: 'Flash' },
+  'google/gemini-3-pro-image': { provider: 'Google', family: 'Nano Banana', tier: 'Pro' },
+  'qwen/qwen-image-3.0': { provider: 'Qwen', family: 'Qwen Image 3.0', tier: 'Flash' },
+  'qwen/qwen-image-3.0-pro': { provider: 'Qwen', family: 'Qwen Image 3.0', tier: 'Pro' },
 }
+
+const MODEL_NOTES: Record<string, string> = {
+  'openai/gpt-image-2.5-flare': 'Быстрая и недорогая, хорошо держит композицию',
+  'openai/gpt-image-2.5-sunburst': 'Точнее следует сложным инструкциям',
+  'google/gemini-3.1-flash-image-preview': 'Быстрая правка и понимание объектов',
+  'google/gemini-3-pro-image': 'Лучшая детализация и свет',
+  'qwen/qwen-image-3.0': 'Сильная работа с текстом в кадре',
+  'qwen/qwen-image-3.0-pro': 'Максимальное качество, дороже остальных',
+}
+
+type Settings = { model: string; prompt: string }
 
 const canvasRef = ref<HTMLCanvasElement | null>(null)
 const workspaceRef = ref<HTMLDivElement | null>(null)
@@ -48,19 +65,36 @@ const isGenerating = ref(false)
 const status = ref('Ready')
 const errorMessage = ref('')
 const prompt = ref('')
-const provider = ref<Provider>('openai')
-const model = ref('gpt-image-1')
-const baseUrl = ref('')
-const apiKey = ref('')
-const settingsOpen = ref(false)
+const model = ref('openai/gpt-image-2.5-flare')
+const catalogModels = ref<ModelEntry[]>([])
+const catalogState = ref<'idle' | 'loading' | 'ready' | 'error'>('idle')
+const catalogError = ref('')
 const generationHistory = ref<HistoryItem[]>([])
 const activeHistory = ref(-1)
 const spacePressed = ref(false)
 const undoStack = ref<UndoSnapshot[]>([])
 const redoStack = ref<UndoSnapshot[]>([])
 const showWelcome = computed(() => !image.value)
-const canGenerate = computed(() => Boolean(image.value && hasMask.value && prompt.value.trim() && !isGenerating.value))
+const canGenerate = computed(() => Boolean(image.value && hasMask.value && prompt.value.trim() && !isGenerating.value && model.value))
 const selectedTool = computed(() => tool.value)
+const activeModel = computed(() => catalogModels.value.find((entry) => entry.id === model.value))
+const modelGroups = computed<ModelGroup[]>(() => {
+  const groups: ModelGroup[] = []
+  const order = ['OpenAI', 'Google', 'Qwen']
+  const sorted = [...catalogModels.value].sort((left, right) => {
+    const leftLabel = modelMeta(left)
+    const rightLabel = modelMeta(right)
+    const providerDelta = order.indexOf(leftLabel.provider) - order.indexOf(rightLabel.provider)
+    return providerDelta !== 0 ? providerDelta : leftLabel.tier.localeCompare(rightLabel.tier)
+  })
+  for (const entry of sorted) {
+    const meta = modelMeta(entry)
+    const existing = groups.find((group) => group.key === `${meta.provider}/${meta.family}`)
+    if (existing) existing.tiers.push(entry)
+    else groups.push({ key: `${meta.provider}/${meta.family}`, provider: meta.provider, family: meta.family, tiers: [entry] })
+  }
+  return groups
+})
 
 let resizeObserver: ResizeObserver | null = null
 let maskCanvas: HTMLCanvasElement | null = null
@@ -82,24 +116,61 @@ const toolItems: Array<{ id: Tool; label: string; icon: typeof Brush }> = [
   { id: 'eraser', label: 'Eraser', icon: Eraser },
 ]
 
+/** Printable name for a catalogue entry, with a readable fallback for unknown ids. */
+function modelMeta(entry: ModelEntry): { provider: string; family: string; tier: string; note: string } {
+  const known = MODEL_LABELS[entry.id]
+  if (known) return { ...known, note: MODEL_NOTES[entry.id] || '' }
+  const [provider = 'Model', slug = entry.id] = entry.id.split('/')
+  return {
+    provider: provider.charAt(0).toUpperCase() + provider.slice(1),
+    family: entry.name || slug,
+    tier: 'Model',
+    note: '',
+  }
+}
+
+async function loadCatalog() {
+  catalogState.value = 'loading'
+  catalogError.value = ''
+  try {
+    const response = await fetch('/api/models')
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({})) as { detail?: string }
+      throw new Error(body.detail || `Catalogue unavailable (${response.status})`)
+    }
+    const body = await response.json() as { models?: ModelEntry[] }
+    const models = (body.models || []).filter((entry) => entry?.id)
+    if (!models.length) throw new Error('Catalogue returned no image models')
+    catalogModels.value = models
+    catalogState.value = 'ready'
+    if (!models.some((entry) => entry.id === model.value)) model.value = models[0].id
+  } catch (error) {
+    catalogState.value = 'error'
+    catalogError.value = error instanceof Error ? error.message : 'Could not load models'
+  }
+}
+
+function selectModel(id: string) {
+  model.value = id
+  const meta = MODEL_LABELS[id]
+  if (meta) setStatus(`${meta.provider} ${meta.family} ${meta.tier} selected`)
+}
+
 function saveSettings() {
-  localStorage.setItem('image-editor-settings', JSON.stringify({ provider: provider.value, model: model.value, baseUrl: baseUrl.value, apiKey: apiKey.value, prompt: prompt.value }))
+  localStorage.setItem('image-editor-settings', JSON.stringify({ model: model.value, prompt: prompt.value }))
 }
 
 function loadSettings() {
   try {
     const saved = JSON.parse(localStorage.getItem('image-editor-settings') || '{}') as Partial<Settings>
-    provider.value = saved.provider || 'openai'
-    model.value = saved.model || 'gpt-image-1'
-    baseUrl.value = saved.baseUrl || ''
-    apiKey.value = saved.apiKey || ''
+    model.value = saved.model || 'openai/gpt-image-2.5-flare'
     prompt.value = saved.prompt || ''
   } catch {
     status.value = 'Settings reset'
   }
 }
 
-watch([provider, model, baseUrl, apiKey, prompt], saveSettings)
+watch([model, prompt], saveSettings)
 
 function setStatus(message: string) {
   status.value = message
@@ -493,8 +564,75 @@ function blobFromMask() {
   return new Promise<Blob>((resolve) => exportCanvas.toBlob((blob) => resolve(blob || new Blob()), 'image/png'))
 }
 
+/**
+ * Blend the generated frame with the original one through the mask.
+ *
+ * The API has no mask parameter, so the model may repaint the whole canvas. Everything
+ * outside the selection is copied back from the source at the target size, and the
+ * editable area gets a feathered edge so seams do not show.
+ */
+function compositeThroughMask(generated: HTMLImageElement, original: HTMLImageElement): HTMLCanvasElement {
+  const width = generated.naturalWidth
+  const height = generated.naturalHeight
+  const output = document.createElement('canvas')
+  output.width = width
+  output.height = height
+  const context = output.getContext('2d')
+  if (!context || !mask.value) {
+    context?.drawImage(generated, 0, 0, width, height)
+    return output
+  }
+
+  const sourceCanvas = document.createElement('canvas')
+  sourceCanvas.width = width
+  sourceCanvas.height = height
+  const sourceContext = sourceCanvas.getContext('2d')
+  if (!sourceContext) return output
+  sourceContext.drawImage(original, 0, 0, width, height)
+
+  // Alpha map in output coordinates: opaque where the user painted, transparent elsewhere.
+  const maskCanvas = document.createElement('canvas')
+  maskCanvas.width = width
+  maskCanvas.height = height
+  const maskContext = maskCanvas.getContext('2d')
+  if (!maskContext) return output
+  const scaled = maskContext.createImageData(width, height)
+  const sourceWidth = imageSize.value.width || width
+  const sourceHeight = imageSize.value.height || height
+  for (let y = 0; y < height; y += 1) {
+    const sourceY = Math.min(sourceHeight - 1, Math.floor((y / height) * sourceHeight))
+    for (let x = 0; x < width; x += 1) {
+      const sourceX = Math.min(sourceWidth - 1, Math.floor((x / width) * sourceWidth))
+      const offset = (y * width + x) * 4
+      scaled.data[offset + 3] = mask.value[sourceY * sourceWidth + sourceX] > 0 ? 255 : 0
+    }
+  }
+  maskContext.putImageData(scaled, 0, 0)
+
+  // Keep only the generated pixels that fall under the mask, feathered by 2 px.
+  const editable = document.createElement('canvas')
+  editable.width = width
+  editable.height = height
+  const editableContext = editable.getContext('2d')
+  if (!editableContext) return output
+  editableContext.filter = 'blur(2px)'
+  editableContext.drawImage(maskCanvas, 0, 0)
+  editableContext.filter = 'none'
+  editableContext.globalCompositeOperation = 'source-in'
+  editableContext.drawImage(generated, 0, 0, width, height)
+
+  context.drawImage(sourceCanvas, 0, 0)
+  context.drawImage(editable, 0, 0)
+  return output
+}
+
+function canvasToBlob(canvas: HTMLCanvasElement): Promise<Blob> {
+  return new Promise((resolve) => canvas.toBlob((blob) => resolve(blob || new Blob()), 'image/png'))
+}
+
 async function generate() {
   if (!canGenerate.value || !image.value || !sourceBlob.value) return
+  const original = image.value
   const beforeGeneration = captureSnapshot()
   isGenerating.value = true
   setStatus('Generating...')
@@ -503,13 +641,8 @@ async function generate() {
     form.append('image', sourceBlob.value, imageName.value || 'image.png')
     form.append('mask', await blobFromMask(), 'mask.png')
     form.append('prompt', prompt.value.trim())
-    form.append('provider', provider.value)
     form.append('model', model.value)
-    form.append('api_key', apiKey.value)
-    form.append('base_url', baseUrl.value)
-    const headers: HeadersInit = {}
-    if (apiKey.value.trim()) headers['X-Provider-API-Key'] = apiKey.value.trim()
-    const response = await fetch('/api/inpaint', { method: 'POST', body: form, headers })
+    const response = await fetch('/api/inpaint', { method: 'POST', body: form })
     if (!response.ok) {
       let message = `Generation failed (${response.status})`
       try {
@@ -520,31 +653,55 @@ async function generate() {
     }
     const resultBlob = await response.blob()
     if (!resultBlob.type.startsWith('image/')) throw new Error('Backend returned a non-image response.')
+
     const resultUrl = URL.createObjectURL(resultBlob)
-    const generated = new Image()
-    generated.onload = () => {
-      if (beforeGeneration) {
-        undoStack.value.push(beforeGeneration)
-        if (undoStack.value.length > 20) undoStack.value.shift()
-        redoStack.value = []
-      }
-      image.value = generated
-      imageUrl.value = resultUrl
-      sourceBlob.value = resultBlob
-      imageName.value = `${imageName.value.replace(/\.[^.]+$/, '')}-generated.png`
-      makeMask(generated.naturalWidth, generated.naturalHeight)
-      const item: HistoryItem = { id: idCounter++, url: resultUrl, label: `Generation ${generationHistory.value.length + 1}`, createdAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) }
-      generationHistory.value.unshift(item)
-      activeHistory.value = 0
-      setStatus('Generation complete')
-      isGenerating.value = false
+    const generated = await new Promise<HTMLImageElement>((resolve, reject) => {
+      const loader = new Image()
+      loader.onload = () => resolve(loader)
+      loader.onerror = () => reject(new Error('Generated image could not be decoded.'))
+      loader.src = resultUrl
+    })
+
+    // Restore unmarked pixels, then hand the composited frame back as the new document.
+    const composited = compositeThroughMask(generated, original)
+    const finalBlob = await canvasToBlob(composited)
+    const finalUrl = URL.createObjectURL(finalBlob)
+    URL.revokeObjectURL(resultUrl)
+
+    const finalImage = await new Promise<HTMLImageElement>((resolve, reject) => {
+      const loader = new Image()
+      loader.onload = () => resolve(loader)
+      loader.onerror = () => reject(new Error('Composited image could not be decoded.'))
+      loader.src = finalUrl
+    })
+
+    if (beforeGeneration) {
+      undoStack.value.push(beforeGeneration)
+      if (undoStack.value.length > 20) undoStack.value.shift()
+      redoStack.value = []
     }
-    generated.onerror = () => { URL.revokeObjectURL(resultUrl); throw new Error('Generated image could not be decoded.') }
-    generated.src = resultUrl
+    image.value = finalImage
+    imageUrl.value = finalUrl
+    sourceBlob.value = finalBlob
+    imageSize.value = { width: finalImage.naturalWidth, height: finalImage.naturalHeight }
+    imageName.value = `${imageName.value.replace(/\.[^.]+$/, '')}-generated.png`
+    makeMask(finalImage.naturalWidth, finalImage.naturalHeight)
+    const meta = MODEL_LABELS[model.value]
+    const item: HistoryItem = {
+      id: idCounter++,
+      url: finalUrl,
+      label: meta ? `${meta.tier} · ${generationHistory.value.length + 1}` : `Generation ${generationHistory.value.length + 1}`,
+      createdAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+    }
+    generationHistory.value.unshift(item)
+    activeHistory.value = 0
+    resetViewport()
+    setStatus('Generation complete')
   } catch (error) {
-    isGenerating.value = false
     errorMessage.value = error instanceof Error ? error.message : 'Generation failed.'
     status.value = 'Error'
+  } finally {
+    isGenerating.value = false
   }
 }
 
@@ -580,6 +737,7 @@ function handleResize() { render() }
 
 onMounted(() => {
   loadSettings()
+  loadCatalog()
   window.addEventListener('keydown', handleKey)
   window.addEventListener('keyup', handleKey)
   window.addEventListener('resize', handleResize)
@@ -689,21 +847,37 @@ onBeforeUnmount(() => {
             <input v-model.number="overlayOpacity" class="range-input" type="range" min="0.1" max="0.8" step="0.01" @input="render" />
           </section>
 
+          <section class="panel-section model-section">
+            <div class="section-heading">
+              <span><Cpu :size="14" /> Model</span>
+              <button v-if="catalogState === 'error'" class="text-button" @click="loadCatalog"><RotateCcw :size="13" /> Retry</button>
+            </div>
+            <p v-if="catalogState === 'loading'" class="model-hint"><LoaderCircle class="spin" :size="14" /> Loading models...</p>
+            <p v-else-if="catalogState === 'error'" class="model-hint error">{{ catalogError }}</p>
+            <div v-else class="model-groups">
+              <div v-for="group in modelGroups" :key="group.key" class="model-group">
+                <span class="model-group-name">{{ group.provider }} {{ group.family }}</span>
+                <div class="model-tiers">
+                  <button
+                    v-for="entry in group.tiers"
+                    :key="entry.id"
+                    class="model-card"
+                    :class="{ active: model === entry.id }"
+                    @click="selectModel(entry.id)"
+                  >
+                    <span class="model-tier">{{ modelMeta(entry).tier }}</span>
+                    <span class="model-note">{{ modelMeta(entry).note }}</span>
+                  </button>
+                </div>
+              </div>
+            </div>
+            <p class="model-current"><Check :size="12" /> {{ activeModel ? modelMeta(activeModel).provider + ' ' + modelMeta(activeModel).family + ' ' + modelMeta(activeModel).tier : model }}</p>
+          </section>
+
           <section class="panel-section prompt-section">
             <div class="section-heading"><span>Prompt</span><span class="required-label">Required</span></div>
             <textarea v-model="prompt" rows="4" placeholder="Describe the change you want to make..." />
             <div class="prompt-footer"><span>{{ prompt.length }} / 500</span><span>Be specific</span></div>
-          </section>
-
-          <section class="panel-section settings-section">
-            <button class="settings-toggle" @click="settingsOpen = !settingsOpen"><span><Settings2 :size="16" /> Provider settings</span><ChevronDown :size="16" :class="{ rotated: settingsOpen }" /></button>
-            <div v-if="settingsOpen" class="settings-fields">
-              <label class="field-label">Provider<select v-model="provider"><option value="openai">OpenAI</option><option value="gemini">Gemini</option><option value="router">Router</option></select></label>
-              <label class="field-label">Model<input v-model="model" placeholder="gpt-image-1" /></label>
-              <label class="field-label">Base URL<input v-model="baseUrl" placeholder="Optional backend override" /></label>
-              <label class="field-label">API key<input v-model="apiKey" type="password" placeholder="Stored locally" /></label>
-              <p class="settings-note">Settings stay in this browser and are sent only when generating.</p>
-            </div>
           </section>
 
           <section v-if="generationHistory.length" class="panel-section history-section">
