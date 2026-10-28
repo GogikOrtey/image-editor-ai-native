@@ -29,6 +29,16 @@ MVP (Фаза 1) - базовый редактор без многопользо
 - `backend/app/services/providers.py` - HTTP adapters для OpenAI-compatible API и Gemini
 - `backend/tests/` - health и API contract tests
 
+## Репозиторий и секреты
+
+- Публичный репозиторий: https://github.com/GogikOrtey/image-editor-ai-native (ветка `main`, remote `origin`)
+- `Ключик и доступные модели.txt` - реальные API-ключи и список моделей. В git не попадает,
+  закрыт в `.gitignore` первой строкой. Не добавлять `-f`, не переносить содержимое в коммиты,
+  README и логи. Перед первым пушем индекс проверен: файла в репозитории нет.
+- `.gitignore` в корне закрывает: секреты (`*.env`, `*.pem`, `*.key`), `node_modules/`, `dist/`,
+  `__pycache__/`, `venv/`, `.pytest_cache/`, а также системные файлы OneDrive (`desktop.ini`
+  и числовой `.ico` рядом с ним).
+
 ## Как запускать
 
 Frontend:
@@ -58,3 +68,6 @@ Frontend и backend MVP реализованы. Upload, canvas tools, zoom/pan, 
 localStorage и PNG export работают на клиенте. FastAPI health и provider proxy routes готовы.
 Проверены `npm run build` и backend tests; реальную генерацию с внешними API ещё нужно проверить
 с рабочими ключом и моделью. Следующий шаг: пользовательская проверка UI и live provider smoke test.
+
+Git: репозиторий инициализирован, первый коммит `6be83a5` (31 файл) отправлен в публичный
+GitHub. Дальнейшая работа ведётся в `main` с пушами в `origin`.
