@@ -67,7 +67,6 @@ def test_white_editable_mask_becomes_transparent_openai_png() -> None:
     converted = Image.open(io.BytesIO(make_openai_alpha_mask(source_buffer.getvalue())))
 
     assert converted.mode == "RGBA"
-    assert converted.getchannel("A").getdata().__iter__().__next__() == 0
     assert list(converted.getchannel("A").getdata()) == [0, 255]
 
 
